@@ -252,7 +252,25 @@ def detect_access_control_missing(source: str, lines: list[str], file: str) -> G
     """
     Detect sensitive functions (mint, burn, pause, upgrade, set*, withdraw)
     without access control modifiers.
+    
+    Skips:
+    - Interface files (no function bodies = no modifiers possible)
+    - Functions inside interface blocks
+    - Files with /interfaces/ in path or I*.sol naming convention
     """
+    # Skip interface files entirely
+    basename = Path(file).name
+    if "/interfaces/" in file or "/interface/" in file:
+        return
+    if re.match(r"^I[A-Z][a-zA-Z0-9]+\.sol$", basename):
+        return
+    
+    # Skip files that only contain interfaces
+    interface_count = len(re.findall(r"\binterface\s+\w+", source))
+    contract_count = len(re.findall(r"\bcontract\s+\w+", source))
+    if interface_count > 0 and contract_count == 0:
+        return
+
     sensitive_funcs = re.compile(
         r"function\s+(mint|burn|pause|unpause|upgrade|set\w+|withdraw\w*|emergencyWithdraw|kill|destroy|transferOwnership)\s*\("
     )
@@ -261,11 +279,47 @@ def detect_access_control_missing(source: str, lines: list[str], file: str) -> G
         "onlyowner", "onlyadmin", "onlyrole", "onlyminter", "onlygovernance",
         "onlyauthorized", "onlyoperator", "onlycontroller", "restricted",
         "auth", "requiresauth", "access_control",
+        # Additional patterns common in protocols
+        "onlymanager", "onlykeeper", "onlyguardian", "onlygov",
+        "onlylrtmanager", "onlylrtadmin", "onlykelpmanager",
+        "onlysupportedasset", "onlylrtoperator",
+        "whennotpaused",
     }
+
+    # Check if the contract inherits from access control base classes
+    ac_bases_lower = [
+        "accesscontrol", "accesscontrolupgradeable",
+        "ownable", "ownableupgradeable", "ownable2step",
+        "lrtconfigrolechecker",
+    ]
+    source_lower = source.lower()
+    has_inherited_ac = any(
+        re.search(rf"\bis\s+[^{{]*\b{base}\b", source_lower)
+        for base in ac_bases_lower
+    )
+    
+    # Check for custom role modifier definitions in the file
+    custom_modifiers = re.findall(r"modifier\s+(only\w+)\s*\(", source)
+    for mod in custom_modifiers:
+        access_modifiers.add(mod.lower())
 
     for match in sensitive_funcs.finditer(source):
         func_name = match.group(1)
         line_no = source[:match.start()].count("\n") + 1
+
+        # Check if this function is inside an interface block
+        in_interface = False
+        for i in range(line_no - 1, max(line_no - 200, -1), -1):
+            if i < 0 or i >= len(lines):
+                continue
+            line = lines[i].strip()
+            if re.match(r"interface\s+\w+", line):
+                in_interface = True
+                break
+            if re.match(r"(abstract\s+)?contract\s+\w+", line):
+                break
+        if in_interface:
+            continue
 
         # Look at the function signature line(s) for modifiers
         sig_text = _get_context(lines, line_no - 1, radius=3).lower()
@@ -274,29 +328,35 @@ def detect_access_control_missing(source: str, lines: list[str], file: str) -> G
         is_internal = "internal" in sig_text or "private" in sig_text
 
         if not has_access and not is_internal:
-            # Check if function body has require(msg.sender ...) early
+            # Check if function body has require(msg.sender ...) or role checks early
             func_body = _extract_function_body(lines, line_no - 1)[:500]
             has_sender_check = re.search(
-                r"require\s*\(\s*msg\.sender\s*==", func_body
+                r"require\s*\(\s*msg\.sender\s*==|_checkrole\(|_checkowner\(\)|hasrole\(",
+                func_body.lower()
             )
 
             if not has_sender_check:
+                # If contract inherits AC, reduce confidence significantly
+                confidence = 60 if not has_inherited_ac else 30
+                
                 yield Finding(
                     id="",
                     title=f"Missing access control on sensitive function {func_name}()",
                     severity=Severity.CRITICAL,
                     impact="Direct theft of any user funds, whether at-rest or in-motion, other than unclaimed yield",
-                    confidence=60,
+                    confidence=confidence,
                     file=file,
                     lines=[line_no],
                     function=func_name,
                     description=(
                         f"The function `{func_name}()` performs a sensitive operation but has no "
                         f"access control modifier or msg.sender check. Any external caller can invoke it."
+                        + (" (Note: contract inherits AccessControl/Ownable — modifier may be applied at implementation level)"
+                           if has_inherited_ac else "")
                     ),
                     recommendation=f"Add an appropriate access control modifier (e.g., onlyOwner) to {func_name}().",
                     detector="custom:missing-access-control",
-                    exploitable_by="any_user",
+                    exploitable_by="any_user" if not has_inherited_ac else "likely_admin_only",
                     raw_detector_id="missing-access-control",
                 )
 
