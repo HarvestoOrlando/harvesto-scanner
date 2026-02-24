@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "harvesto-scanner"
+version = "0.1.0"
+description = "Precision-first smart contract vulnerability scanner with 90% FP reduction"
+requires-python = ">=3.10"
+dependencies = [
+    "slither-analyzer>=0.10.0",
+    "solc-select>=1.0.4",
+    "crytic-compile>=0.3.6",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+    "click>=8.1",
+    "dataclasses-json>=0.6",
+]
+
+[project.scripts]
+harvesto = "harvesto_scanner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

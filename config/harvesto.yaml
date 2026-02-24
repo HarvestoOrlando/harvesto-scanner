@@ -1,0 +1,58 @@
+# Harvesto Scanner Configuration
+# Copy to your project as harvesto.yaml and customize
+
+# Minimum severity to include in reports
+# Options: critical, high, medium, low
+min_severity: low
+
+# Minimum confidence score (0-100) to include findings
+# Higher = fewer findings but less noise
+# Recommended: 50 (default), 70 (strict), 30 (loose)
+confidence_threshold: 50
+
+# Solidity compiler version (auto-detected if not set)
+# solc_version: "0.8.20"
+
+# Directories to exclude from scanning
+exclude_dirs:
+  - node_modules
+  - lib
+  - .git
+  - cache
+  - out
+  - artifacts
+  - build
+
+# File patterns to treat as test files (findings in these are filtered)
+test_patterns:
+  - "/test/"
+  - "/tests/"
+  - ".t.sol"
+  - "Test.sol"
+  - "/mock/"
+  - "/script/"
+
+# Known safe libraries (findings in these are filtered)
+safe_libraries:
+  - "@openzeppelin/"
+  - "openzeppelin-contracts/"
+  - "solmate/"
+  - "solady/"
+  - "forge-std/"
+  - "ds-test/"
+
+# Custom detector toggles
+detectors:
+  slither: true
+  flashloan_callback: true
+  price_manipulation: true
+  missing_slippage: true
+  cross_function_reentrancy: true
+  missing_access_control: true
+  unsafe_delegatecall: true
+  unchecked_call: true
+  storage_collision: true
+
+# Output format
+# Options: json, markdown, evmbench
+output_format: json
