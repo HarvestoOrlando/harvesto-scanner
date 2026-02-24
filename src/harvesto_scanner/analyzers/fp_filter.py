@@ -69,6 +69,8 @@ class FPFilterEngine:
             "filtered_internal_private": 0,
             "filtered_low_confidence": 0,
             "filtered_interface": 0,
+            "filtered_protocol_internal": 0,
+            "filtered_inherited_ac": 0,
             "survived": 0,
         }
 
@@ -146,7 +148,28 @@ class FPFilterEngine:
         return f
 
     def _filter_interfaces_abstracts(self, f: Finding) -> Optional[Finding]:
-        """Remove findings in interface or abstract contract definitions."""
+        """
+        Remove findings in interface or abstract contract definitions.
+        
+        Catches:
+        1. Files containing only interface definitions (no contract keyword)
+        2. Files in /interfaces/ directories
+        3. Files named I*.sol (e.g., ILayerZeroUserApplicationConfig.sol)
+        4. Files in /external/ directories containing only interfaces
+        """
+        file_path = f.file
+        basename = Path(file_path).name
+
+        # Path-based interface detection
+        if "/interfaces/" in file_path or "/interface/" in file_path:
+            self.stats["filtered_interface"] += 1
+            return None
+
+        # Filename convention: ISomething.sol = interface file
+        if re.match(r"^I[A-Z][a-zA-Z0-9]+\.sol$", basename):
+            self.stats["filtered_interface"] += 1
+            return None
+
         source = self.source_cache.get(f.file, "")
         if not source:
             return f
@@ -158,6 +181,21 @@ class FPFilterEngine:
         if interface_count > 0 and contract_count == 0:
             self.stats["filtered_interface"] += 1
             return None
+
+        # Check if the specific function being flagged is inside an interface block
+        if f.function and f.lines:
+            lines = source.split("\n")
+            target_line = f.lines[0] - 1
+            # Walk backwards to find enclosing interface/contract
+            for i in range(target_line, max(target_line - 200, -1), -1):
+                if i < 0 or i >= len(lines):
+                    continue
+                line = lines[i].strip()
+                if re.match(r"interface\s+\w+", line):
+                    self.stats["filtered_interface"] += 1
+                    return None
+                if re.match(r"(abstract\s+)?contract\s+\w+", line):
+                    break  # it's inside a contract, not an interface
 
         return f
 
@@ -256,6 +294,12 @@ class FPFilterEngine:
         The big one. If a function requires a privileged role, an unprivileged
         attacker can't exploit it. Owner-protected functions are NOT vulnerabilities
         from a bug bounty perspective (Immunefi explicitly excludes these).
+        
+        Enhanced: Also detects INHERITED access control from base contracts like
+        OpenZeppelin AccessControl, AccessControlUpgradeable, Ownable, etc.
+        If a contract inherits these, functions with role-gated names (set*, pause,
+        mint, burn, etc.) likely have modifiers applied at the implementation level
+        that the regex doesn't see in the function signature alone.
         """
         source = self.source_cache.get(f.file, "")
         if not source:
@@ -267,19 +311,99 @@ class FPFilterEngine:
 
         func_sig_lower = func_sig.lower()
 
-        # Check for access control modifiers
+        # Direct modifier check — function signature contains modifier keyword
         for mod in ACCESS_CONTROL_MODIFIERS:
             if mod in func_sig_lower:
-                # This function is admin-only — not a bounty-eligible vuln
                 self.stats["filtered_access_control"] += 1
                 f.exploitable_by = "admin_only"
-                # Don't remove entirely — could be useful info —
-                # but drop to informational and below threshold
                 f.severity = Severity.INFORMATIONAL
                 f.confidence = 10
                 return f  # will be caught by confidence threshold
 
+        # Check for inline role checks in function body (not just msg.sender ==)
+        lines = source.split("\n")
+        func_body = self._get_function_body_text(lines, f.function)
+        if func_body:
+            body_start = func_body[:500].lower()
+            role_check_patterns = [
+                r"_checkrole\(",
+                r"_checkowner\(\)",
+                r"require\s*\(\s*hasrole\(",
+                r"if\s*\(\s*!hasrole\(",
+                r"require\s*\(\s*msg\.sender\s*==\s*\w*(owner|admin|manager|operator|governance|guardian)\b",
+                r"onlyrole",
+                r"accesscontrol",
+                r"_onlymanager\(\)",
+                r"_onlyadmin\(\)",
+            ]
+            for pattern in role_check_patterns:
+                if re.search(pattern, body_start):
+                    self.stats["filtered_access_control"] += 1
+                    f.exploitable_by = "admin_only"
+                    f.severity = Severity.INFORMATIONAL
+                    f.confidence = 10
+                    return f
+
+        # ── INHERITED ACCESS CONTROL ──
+        # If the contract inherits from AccessControl/Ownable AND the finding 
+        # is from the missing-access-control detector, check more carefully.
+        # These base contracts provide role infrastructure that gets applied
+        # via modifiers the regex can't see (especially in proxy/upgradeable patterns).
+        if f.raw_detector_id == "missing-access-control":
+            inherited_ac = self._contract_has_inherited_access_control(source)
+            if inherited_ac:
+                # Contract has AccessControl/Ownable in its inheritance chain.
+                # The missing-access-control detector flagged this because it
+                # couldn't see the modifier in the function signature, but the 
+                # contract's base class provides it. Heavily penalize confidence.
+                f.confidence = max(f.confidence - 40, 10)
+                f.exploitable_by = "likely_admin_only (inherited)"
+                self.stats["filtered_access_control"] += 1
+                return f
+
         return f
+
+    def _contract_has_inherited_access_control(self, source: str) -> bool:
+        """
+        Check if any contract in this file inherits from known access control
+        base contracts (OpenZeppelin AccessControl, Ownable, etc.).
+        
+        Matches patterns like:
+        - contract X is AccessControl, ...
+        - contract X is OwnableUpgradeable, ...
+        - contract X is AccessControlUpgradeable, ...
+        - import {AccessControl} from "@openzeppelin/..."
+        """
+        ac_bases = [
+            "AccessControl", "AccessControlUpgradeable",
+            "AccessControlEnumerable", "AccessControlEnumerableUpgradeable",
+            "Ownable", "OwnableUpgradeable", "Ownable2Step", "Ownable2StepUpgradeable",
+            "AccessControlDefaultAdminRules",
+            # Kelp-specific and common protocol patterns
+            "LRTConfigRoleChecker",
+            "Pausable", "PausableUpgradeable",
+        ]
+
+        source_lower = source.lower()
+        
+        for base in ac_bases:
+            base_lower = base.lower()
+            # Check inheritance: "is AccessControl" or "is X, AccessControl, Y"
+            if re.search(rf"\bis\s+[^{{]*\b{re.escape(base_lower)}\b", source_lower):
+                return True
+            # Check imports
+            if re.search(rf"import\s+.*\b{re.escape(base_lower)}\b", source_lower):
+                return True
+
+        # Also check for custom role-checker patterns common in protocols
+        # e.g., modifier onlyLRTManager, modifier onlyKelpDaoAdmin
+        custom_role_modifiers = re.findall(
+            r"modifier\s+(only\w+|require\w+Role)\s*\(", source
+        )
+        if len(custom_role_modifiers) >= 1:
+            return True
+
+        return False
 
     def _filter_msg_sender_validated(self, f: Finding) -> Optional[Finding]:
         """
@@ -360,6 +484,80 @@ class FPFilterEngine:
                     if re.search(pattern, source):
                         f.confidence = max(f.confidence - 35, 5)
                         break
+
+        # ── Protocol-internal ETH transfers ──
+        # Slither flags any .call{value:} as arbitrary-send-eth, but many are
+        # protocol-to-protocol transfers between trusted contracts (e.g., 
+        # DepositPool → NodeDelegator → UnstakingVault).
+        # If the destination is fetched from a config/registry contract or is a
+        # hardcoded protocol interface call, it's not user-controlled.
+        if f.raw_detector_id in ("arbitrary-send-eth", "arbitrary-send-erc20"):
+            f = self._check_protocol_internal_transfer(f, source)
+
+        return f
+
+    def _check_protocol_internal_transfer(self, f: Finding, source: str) -> Finding:
+        """
+        Reduce confidence for ETH/ERC20 sends to protocol-internal addresses.
+        
+        Patterns that indicate trusted destinations:
+        - ILRTDepositPool(address).receiveFrom*{value:}()
+        - INodeDelegator(nd).sendETH*{value:}()
+        - ILRTUnstakingVault(vault).receiveFrom*{value:}()
+        - Any call where destination comes from a config/registry lookup
+        - Calls to well-known protocol interfaces (Lido, Aave, EigenLayer)
+        """
+        description_lower = (f.description or "").lower()
+
+        # Pattern 1: Destination is a protocol interface call
+        # e.g., ILRTDepositPool(x).receiveFromNodeDelegator{value:}()
+        protocol_interface_patterns = [
+            r"I[A-Z]\w+\([^)]*\)\.\w+\{value:",   # ISomething(addr).func{value:}
+            r"receiveFrom\w+\{value:",               # receiveFromNodeDelegator{value:}
+            r"sendETH\w*\{value:",                   # sendETHFromUnstakingVault{value:}
+        ]
+        
+        lines = source.split("\n")
+        func_body = self._get_function_body_text(lines, f.function)
+        if func_body:
+            for pattern in protocol_interface_patterns:
+                if re.search(pattern, func_body):
+                    f.confidence = max(f.confidence - 30, 15)
+                    f.exploitable_by = "protocol_internal_transfer"
+                    return f
+
+        # Pattern 2: Destination comes from config/registry lookup
+        config_lookup_patterns = [
+            r"getLrtconfig\(\)", r"getcontract\(",
+            r"lrtconfig\.", r"config\.\w+address",
+            r"nodedelegatorsqueue", r"nodedelegatorqueue",
+            r"lrtdepositpool", r"unstakingvault",
+            r"eigenpodmanager", r"delegationmanager",
+            r"aavewethgateway", r"aavepool",
+        ]
+        
+        if func_body:
+            body_lower = func_body.lower()
+            config_matches = sum(1 for p in config_lookup_patterns if re.search(p, body_lower))
+            if config_matches >= 1:
+                f.confidence = max(f.confidence - 25, 15)
+                f.exploitable_by = "protocol_internal_transfer"
+                return f
+
+        # Pattern 3: Well-known external protocol calls (Lido, Aave, EigenLayer)
+        external_protocol_calls = [
+            r"\.submit\{value:",            # Lido stETH
+            r"\.stake\{value:",             # EigenLayer staking
+            r"\.depositETH\{value:",        # Aave WETH gateway
+            r"ILido\(", r"IEigenPodManager\(",
+            r"\.send\{value:.*layerzero",   # LayerZero cross-chain
+        ]
+        
+        for pattern in external_protocol_calls:
+            if re.search(pattern, description_lower) or (func_body and re.search(pattern, func_body, re.IGNORECASE)):
+                f.confidence = max(f.confidence - 25, 15)
+                f.exploitable_by = "external_protocol_call"
+                return f
 
         return f
 
