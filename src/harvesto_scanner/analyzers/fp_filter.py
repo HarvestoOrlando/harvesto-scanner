@@ -105,6 +105,12 @@ class FPFilterEngine:
             self._filter_self_inflicted_prerequisite,
             self._filter_admin_migration_roles,
             self._filter_external_integration_rounding,
+            # ── Filters from Kelp DAO scan FP analysis (Round 2) ──
+            self._filter_early_return_equality_guards,
+            self._filter_reentrancy_with_guards,
+            self._filter_layerzero_gas_payments,
+            self._filter_controlled_token_list,
+            self._filter_merkle_verified_withdrawals,
             self._filter_confidence_threshold,
         ]
 
@@ -558,6 +564,355 @@ class FPFilterEngine:
                 f.confidence = max(f.confidence - 25, 15)
                 f.exploitable_by = "external_protocol_call"
                 return f
+
+        # Pattern 4: ETH returned to msg.sender in a swap/exchange function
+        # e.g., swapAssetForETH sends ETH back to the caller as part of a swap.
+        # The caller deposits asset X and receives ETH back — this is by design,
+        # not an arbitrary send. The "arbitrary" destination is the legitimate caller.
+        if func_body:
+            body_lower = func_body.lower()
+            is_swap_return = (
+                ("msg.sender" in func_body or "address(msg.sender)" in func_body) and
+                any(kw in f.function.lower() for kw in ["swap", "exchange", "convert", "redeem"])
+            )
+            if is_swap_return:
+                f.confidence = max(f.confidence - 30, 15)
+                f.exploitable_by = "swap_return_to_caller"
+                return f
+
+        # Pattern 5: Internal function that sends to a parameter `to` which is 
+        # validated by the calling function. _transferAsset(to, amount) where 
+        # `to` comes from withdrawal records, not user input directly.
+        if f.function.startswith("_") and func_body:
+            body_lower = func_body.lower()
+            # Internal helper with `to` parameter — the caller validates `to`
+            if re.search(r"function\s+_\w+.*\baddress\s+to\b", func_body):
+                f.confidence = max(f.confidence - 20, 20)
+                f.exploitable_by = "internal_helper_validated_param"
+                return f
+
+        return f
+
+    # ------------------------------------------------------------------
+    # Filters from Kelp DAO scan FP analysis (Round 2)
+    # All 15 findings from the filtered Kelp scan were FPs.
+    # These 5 filters catch the patterns that slipped through.
+    # ------------------------------------------------------------------
+
+    def _filter_early_return_equality_guards(self, f: Finding) -> Optional[Finding]:
+        """
+        Filter: EARLY_RETURN_EQUALITY_GUARD
+        Source: Kelp DAO HARVESTO-0008/0009/0010/0011/0012/0013
+
+        Slither's incorrect-equality detector flags `== 0` checks as dangerous
+        strict equality. But many of these are early-return guards:
+            if (amount == 0) revert ZeroAmount();
+            if (balance == 0) return;
+        
+        These are safe — they prevent zero-value operations, not balance comparisons
+        that an attacker could manipulate by dusting.
+        """
+        if f.raw_detector_id != "incorrect-equality":
+            return f
+
+        description_lower = (f.description or "").lower()
+        title_lower = (f.title or "").lower()
+        
+        # Only handle == 0 patterns
+        if "== 0" not in description_lower and "== 0" not in title_lower:
+            return f
+
+        source = self.source_cache.get(f.file, "")
+        if not source:
+            return f
+
+        lines = source.split("\n")
+        func_body = self._get_function_body_text(lines, f.function)
+
+        # Try to match from function body
+        if func_body:
+            body_lines = func_body.split("\n")[:8]
+            early_body = "\n".join(body_lines).lower()
+
+            guard_patterns = [
+                r"==\s*0\s*\)\s*\{?\s*(revert|return)",
+                r"==\s*0\s*\)\s*revert",
+                r"require\s*\([^)]*!=\s*0",
+                r"if\s*\([^)]*==\s*0[^)]*\)\s*(revert|return|\{)",
+            ]
+
+            for pattern in guard_patterns:
+                if re.search(pattern, early_body):
+                    f.confidence = max(f.confidence - 35, 10)
+                    self.stats.setdefault("filtered_early_return_guard", 0)
+                    self.stats["filtered_early_return_guard"] += 1
+                    return f
+
+            param_guard_names = [
+                "amount", "amt", "_amount", "value", "_value", "count",
+                "claimableamount", "idlebalance", "totalavailableassets",
+            ]
+            for name in param_guard_names:
+                if name in early_body and "== 0" in early_body:
+                    f.confidence = max(f.confidence - 25, 15)
+                    self.stats.setdefault("filtered_early_return_guard", 0)
+                    self.stats["filtered_early_return_guard"] += 1
+                    return f
+
+        # Fallback: match from description
+        # Slither descriptions include the variable name: "claimableAmount == 0"
+        # If the == 0 variable is clearly a parameter/amount (not a balance from 
+        # an external source), it's an early-return guard
+        guard_var_patterns = [
+            r"\b(amount|amt|value|count|balance|claimable\w*|idle\w*|totalavailable\w*)\s*==\s*0",
+        ]
+        for pattern in guard_var_patterns:
+            if re.search(pattern, description_lower):
+                f.confidence = max(f.confidence - 30, 15)
+                self.stats.setdefault("filtered_early_return_guard", 0)
+                self.stats["filtered_early_return_guard"] += 1
+                return f
+
+        return f
+
+    def _filter_reentrancy_with_guards(self, f: Finding) -> Optional[Finding]:
+        """
+        Filter: REENTRANCY_WITH_MERKLE_OR_BITMAP_GUARD
+        Source: Kelp DAO HARVESTO-0004 (MerkleDistributor.claim)
+
+        MerkleDistributor.claim() was flagged for reentrancy, but:
+        1. It uses a claimed bitmap — _setClaimed(index) marks the index as claimed
+        2. Re-entering claim() with the same index hits the isClaimed() check
+        3. The bitmap IS the reentrancy guard — you can't claim twice
+
+        Also catches: functions that set a boolean/mapping BEFORE the external call
+        (checks-effects-interactions even if no nonReentrant modifier).
+
+        Rule: If the function sets a state flag (mapping, bool, bitmap) before
+        the external call, reentrancy is mitigated even without nonReentrant.
+        """
+        if "reentrancy" not in f.raw_detector_id:
+            return f
+
+        source = self.source_cache.get(f.file, "")
+        if not source:
+            return f
+
+        lines = source.split("\n")
+        func_body = self._get_function_body_text(lines, f.function)
+        if not func_body:
+            return f
+
+        body_lower = func_body.lower()
+
+        # Pattern 1: Merkle distributor claim with bitmap
+        # Key: the guard must appear BEFORE the external call in the function body
+        merkle_guard_patterns = [
+            r"isclaimed\s*\(",          # isClaimed(index) check
+            r"_setclaimed\s*\(",        # _setClaimed(index) before transfer
+            r"claimedbitmap",          # claimedBitMap usage
+        ]
+        
+        # Find the position of the external call
+        external_call_pos = None
+        for call_pattern in [r"\.(call|transfer|send)\s*[({]", r"safetransfer\s*\("]:
+            match = re.search(call_pattern, body_lower)
+            if match:
+                external_call_pos = match.start()
+                break
+
+        if external_call_pos is not None:
+            # Only count guards that appear BEFORE the external call
+            body_before_call = body_lower[:external_call_pos]
+            
+            for pattern in merkle_guard_patterns:
+                if re.search(pattern, body_before_call):
+                    f.confidence = max(f.confidence - 30, 10)
+                    self.stats.setdefault("filtered_reentrancy_guarded", 0)
+                    self.stats["filtered_reentrancy_guarded"] += 1
+                    return f
+
+            # Pattern 2: State flag set BEFORE external call
+            state_write_patterns = [
+                r"claimed\[.*\]\s*=\s*true",
+                r"=\s*true\s*;",
+                r"\[\w+\]\s*=\s*(true|1|block\.)",
+                r"_set\w+\(",
+            ]
+            for pattern in state_write_patterns:
+                if re.search(pattern, body_before_call):
+                    f.confidence = max(f.confidence - 25, 15)
+                    self.stats.setdefault("filtered_reentrancy_guarded", 0)
+                    self.stats["filtered_reentrancy_guarded"] += 1
+                    return f
+
+        return f
+
+    def _filter_layerzero_gas_payments(self, f: Finding) -> Optional[Finding]:
+        """
+        Filter: LAYERZERO_GAS_PAYMENT
+        Source: Kelp DAO HARVESTO-0001 (MultiChainRateProvider.updateRate)
+
+        LayerZero's ILayerZeroEndpoint.send{value: estimatedFee}() is NOT
+        an arbitrary ETH send. The value pays the LayerZero relayer gas fee
+        for cross-chain message delivery. The ETH goes to the LayerZero
+        endpoint contract, not to an attacker.
+
+        Rule: If the call is to ILayerZeroEndpoint.send() or similar cross-chain
+        messaging endpoints, the {value:} is a gas payment, not a transfer.
+        """
+        if f.raw_detector_id not in ("arbitrary-send-eth",):
+            return f
+
+        description_lower = (f.description or "").lower()
+        
+        # Cross-chain gas payment patterns
+        crosschain_gas_patterns = [
+            "layerzeroendpoint",
+            "ilayerzeroendpoint",
+            "lzendpoint",
+            "estimatedfee",
+            "estimatefees",
+            "adapterparams",
+            "remoteandlocaladdresses",
+            # Other cross-chain bridges
+            "ccipsend",
+            "bridgefee",
+            "crosschainmessage",
+        ]
+
+        if any(p in description_lower for p in crosschain_gas_patterns):
+            f.confidence = max(f.confidence - 35, 10)
+            f.exploitable_by = "crosschain_gas_payment"
+            self.stats.setdefault("filtered_crosschain_gas", 0)
+            self.stats["filtered_crosschain_gas"] += 1
+            return f
+
+        # Also check function body
+        source = self.source_cache.get(f.file, "")
+        if source:
+            func_body = self._get_function_body_text(source.split("\n"), f.function)
+            if func_body:
+                body_lower = func_body.lower()
+                if any(p in body_lower for p in crosschain_gas_patterns):
+                    f.confidence = max(f.confidence - 35, 10)
+                    f.exploitable_by = "crosschain_gas_payment"
+                    self.stats.setdefault("filtered_crosschain_gas", 0)
+                    self.stats["filtered_crosschain_gas"] += 1
+
+        return f
+
+    def _filter_controlled_token_list(self, f: Finding) -> Optional[Finding]:
+        """
+        Filter: CONTROLLED_TOKEN_LIST
+        Source: Kelp DAO HARVESTO-0014 (ERC677 fee-on-transfer)
+
+        Fee-on-transfer and rebasing token detectors flag ANY token transfer
+        that doesn't use balance snapshots. But if the protocol controls which
+        tokens are supported (admin-managed whitelist), fee-on-transfer tokens
+        will never be added.
+
+        Rule: If the contract or its config has a supported asset list / whitelist
+        mechanism, fee-on-transfer findings are low-risk.
+        """
+        if f.raw_detector_id not in ("weird-erc20-fee-on-transfer", "fee-on-transfer"):
+            return f
+
+        source = self.source_cache.get(f.file, "")
+        if not source:
+            return f
+
+        source_lower = source.lower()
+
+        # Check all source files for token whitelist patterns
+        whitelist_patterns = [
+            r"supportedasset", r"issupportedasset",
+            r"allowedtoken", r"whitelistedtoken",
+            r"supportedtoken", r"tokenwhitelist",
+            r"addnewsupportedasset", r"addsupportedasset",
+            r"onlysupportedasset",
+        ]
+
+        # Check current file
+        has_whitelist = any(re.search(p, source_lower) for p in whitelist_patterns)
+
+        # Also check across all source files (config contracts define the whitelist)
+        if not has_whitelist:
+            for file_path, file_source in self.source_cache.items():
+                if any(re.search(p, file_source.lower()) for p in whitelist_patterns):
+                    has_whitelist = True
+                    break
+
+        if has_whitelist:
+            f.confidence = max(f.confidence - 30, 10)
+            f.exploitable_by = "controlled_token_list"
+            self.stats.setdefault("filtered_controlled_tokens", 0)
+            self.stats["filtered_controlled_tokens"] += 1
+
+        return f
+
+    def _filter_merkle_verified_withdrawals(self, f: Finding) -> Optional[Finding]:
+        """
+        Filter: MERKLE_VERIFIED_WITHDRAWAL
+        Source: Kelp DAO HARVESTO-0005 (KernelDepositPool.claimWithdrawal)
+
+        The l2-withdrawal-proof detector flags any function named claim*/finalize*
+        that doesn't have explicit proof verification visible in the function body.
+        But many protocols:
+        1. Verify proofs in a separate internal function
+        2. Use MerkleProof.verify() from OpenZeppelin
+        3. Have the proof check in a modifier or inherited function
+
+        Rule: If the function or its surrounding context uses MerkleProof,
+        verifyProof, or similar verification, the finding is FP.
+        """
+        if f.raw_detector_id not in ("l2-withdrawal-proof",):
+            return f
+
+        source = self.source_cache.get(f.file, "")
+        if not source:
+            return f
+
+        source_lower = source.lower()
+
+        # Check if the FILE (not just function) has proof verification
+        proof_patterns = [
+            r"merkleproof\.verify",
+            r"merkleproof\.processproof",
+            r"verifyproof",
+            r"_verifymerkleproof",
+            r"merkle\.verify",
+            r"proof\s*\)\s*==\s*root",
+            r"verifywithdrawal",
+            r"_verifywithdrawal",
+            r"withdrawalproof",
+            r"outputrootproof",
+        ]
+
+        for pattern in proof_patterns:
+            if re.search(pattern, source_lower):
+                f.confidence = max(f.confidence - 35, 10)
+                self.stats.setdefault("filtered_merkle_verified", 0)
+                self.stats["filtered_merkle_verified"] += 1
+                return f
+
+        # Also check: is there a separate verification step (e.g., requestWithdrawal 
+        # records the request, claimWithdrawal just releases pre-verified funds)?
+        two_step_patterns = [
+            r"requestwithdrawal",
+            r"initiatewithdrawal",
+            r"queuewithdrawal",
+            r"withdrawalrequest\[",
+            r"pendingwithdrawals\[",
+            r"withdrawalqueue",
+        ]
+
+        two_step_count = sum(1 for p in two_step_patterns if re.search(p, source_lower))
+        if two_step_count >= 2:
+            # Has a two-step withdrawal pattern — claim is just releasing pre-verified funds
+            f.confidence = max(f.confidence - 30, 15)
+            self.stats.setdefault("filtered_merkle_verified", 0)
+            self.stats["filtered_merkle_verified"] += 1
 
         return f
 
